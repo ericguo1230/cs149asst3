@@ -27,6 +27,7 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -42,19 +43,52 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
-void exclusive_scan(int* input, int N, int* result)
-{
 
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
+__global__ void exclusive_scan_kernel_upsweep(int N, int* result, int two_d) {
+      int two_dplus1 = 2 * two_d;
+      int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
+      if (tid < N / two_dplus1) {
+          int i = tid * two_dplus1;
+          result[i + two_dplus1 - 1] += result[i + two_d - 1];
+      }
+  }
 
+__global__ void exclusive_scan_kernel_downsweep(int N, int* result, int two_d) {
+    int two_dplus1 = 2 * two_d;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < N / two_dplus1) {
+        int i = tid * two_dplus1;
+
+        int t = result[i + two_d - 1];
+        result[i + two_d - 1] = result[i + two_dplus1 - 1];
+        result[i + two_dplus1 - 1] += t;
+    }
+}
+
+void exclusive_scan(int* input, int N, int* result) {
+    int rounded_N = nextPow2(N);
+
+    for (int two_d = 1; two_d <= rounded_N / 2; two_d *= 2) {
+        int work = rounded_N / (2 * two_d);
+        int blocks = (work + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+        exclusive_scan_kernel_upsweep<<<blocks, THREADS_PER_BLOCK>>>(
+            rounded_N, result, two_d
+        );
+    }
+
+    cudaMemset(result + rounded_N - 1, 0, sizeof(int));
+
+    for (int two_d = rounded_N / 2; two_d >= 1; two_d /= 2) {
+        int work = rounded_N / (2 * two_d);
+        int blocks = (work + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+        exclusive_scan_kernel_downsweep<<<blocks, THREADS_PER_BLOCK>>>(
+            rounded_N, result, two_d
+        );
+    }
 }
 
 
@@ -141,6 +175,30 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void
+flag_repeats_kernel(int* input, int length, int* output){
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (index >= length)
+        return;
+    
+    if ((index < length - 1) && (input[index] == input[index + 1])){
+        output[index] = 1;
+    } else{
+        output[index] = 0;
+    }
+}
+
+__global__ void
+insert_repeats_output_kernel(int *input, int length, int *output){
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if ((index < length - 1) && (input[index] != input[index+1])){
+        output[input[index]] = index;
+    }
+    
+}
+
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
@@ -148,20 +206,27 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 //
 // Returns the total number of pairs found
 int find_repeats(int* device_input, int length, int* device_output) {
+    int rounded_length = nextPow2(length);
+    int *tmp_buff;
+    cudaMalloc((void **)&tmp_buff, rounded_length * sizeof(int));
 
-    // CS149 TODO:
-    //
-    // Implement this function. You will probably want to
-    // make use of one or more calls to exclusive_scan(), as well as
-    // additional CUDA kernel launches.
-    //    
-    // Note: As in the scan code, the calling code ensures that
-    // allocated arrays are a power of 2 in size, so you can use your
-    // exclusive_scan function with them. However, your implementation
-    // must ensure that the results of find_repeats are correct given
-    // the actual array length.
+    //Step 1: Flag repeats
+    const int blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    flag_repeats_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, length, tmp_buff);
 
-    return 0; 
+    //Step 2: Perform exclusive_scan to get indexes of repeats
+    exclusive_scan(device_input, length, tmp_buff);
+
+    //Step 3: Get element at length - 1 to get total number of pairs
+    int tot_pairs;
+    cudaMemcpy(&tot_pairs, tmp_buff + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    //Step 4: Put results in output list (We can do something similar to flag repeats)
+    insert_repeats_output_kernel<<<blocks, THREADS_PER_BLOCK>>>(
+        tmp_buff, length, device_output
+    );
+
+    return tot_pairs; 
 }
 
 
@@ -173,10 +238,9 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
 
     int *device_input;
     int *device_output;
-    int rounded_length = nextPow2(length);
     
-    cudaMalloc((void **)&device_input, rounded_length * sizeof(int));
-    cudaMalloc((void **)&device_output, rounded_length * sizeof(int));
+    cudaMalloc((void **)&device_input, length * sizeof(int));
+    cudaMalloc((void **)&device_output, length * sizeof(int));
     cudaMemcpy(device_input, input, length * sizeof(int), cudaMemcpyHostToDevice);
 
     cudaDeviceSynchronize();
